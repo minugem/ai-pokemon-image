@@ -6,8 +6,7 @@ function App() {
   const [baseImageFile, setBaseImageFile] = useState(null)
   const [backgroundMask, setBackgroundMask] = useState(null)
   const [originalImageData, setOriginalImageData] = useState(null) // Store original processed image data
-  const [pokemonImage, setPokemonImage] = useState(null)
-  const [pokemonStyle, setPokemonStyle] = useState(null)
+  const [pokemonList, setPokemonList] = useState([]) // Array of {imageUrl, scale, left, top}
   const [isLoading, setIsLoading] = useState(false)
   const [isProcessingBackground, setIsProcessingBackground] = useState(false)
   const [backgroundThreshold, setBackgroundThreshold] = useState(0.5)
@@ -26,8 +25,7 @@ function App() {
       setBaseImage(imageUrl)
       setBaseImageFile(file)
       // Clear Pokemon overlay when new image is selected
-      setPokemonImage(null)
-      setPokemonStyle(null)
+      setPokemonList([])
       setBackgroundMask(null)
       // Process background after image loads
       setIsProcessingBackground(true)
@@ -219,8 +217,7 @@ function App() {
     }
     setBaseImage(null)
     setBaseImageFile(null)
-    setPokemonImage(null)
-    setPokemonStyle(null)
+    setPokemonList([])
     setBackgroundMask(null)
     setOriginalImageData(null)
     if (fileInputRef.current) {
@@ -228,7 +225,40 @@ function App() {
     }
   }
 
-  const findBackgroundPosition = (scale, imageWidth, imageHeight, maskWidth, maskHeight) => {
+  // Check if two Pokemon rectangles overlap (with padding to prevent being too close)
+  const checkCollision = (pokemon1, pokemon2, padding = 10) => {
+    const pokemon1Right = pokemon1.x + pokemon1.width + padding
+    const pokemon1Bottom = pokemon1.y + pokemon1.height + padding
+    const pokemon1Left = pokemon1.x - padding
+    const pokemon1Top = pokemon1.y - padding
+    
+    const pokemon2Right = pokemon2.x + pokemon2.width + padding
+    const pokemon2Bottom = pokemon2.y + pokemon2.height + padding
+    const pokemon2Left = pokemon2.x - padding
+    const pokemon2Top = pokemon2.y - padding
+
+    // Check if rectangles overlap
+    return !(
+      pokemon1Right < pokemon2Left ||
+      pokemon1Left > pokemon2Right ||
+      pokemon1Bottom < pokemon2Top ||
+      pokemon1Top > pokemon2Bottom
+    )
+  }
+
+  // Check if a position collides with existing Pokemon
+  const checkCollisionWithExisting = (x, y, width, height, existingPokemon) => {
+    const newPokemon = { x, y, width, height }
+    
+    for (const existing of existingPokemon) {
+      if (checkCollision(newPokemon, existing)) {
+        return true
+      }
+    }
+    return false
+  }
+
+  const findBackgroundPosition = (scale, imageWidth, imageHeight, maskWidth, maskHeight, existingPokemon = []) => {
     const pokemonWidth = imageWidth * scale
     const pokemonHeight = imageHeight * scale
     
@@ -295,7 +325,10 @@ function App() {
       const randomY = Math.random() * maxY
       
       if (isPositionValid(randomX, randomY)) {
-        backgroundPositions.push({ x: randomX, y: randomY })
+        // Check collision with existing Pokemon
+        if (!checkCollisionWithExisting(randomX, randomY, pokemonWidth, pokemonHeight, existingPokemon)) {
+          backgroundPositions.push({ x: randomX, y: randomY })
+        }
       }
     }
     
@@ -310,90 +343,108 @@ function App() {
   }
 
   const handleGenerate = async () => {
-    if (!baseImage || !backgroundMask) return
+    if (!baseImage || !backgroundMask || !imageRef.current) return
     
     setIsLoading(true)
     try {
-      // Generate random Pokemon ID between 1-151
-      const randomPokemonId = Math.floor(Math.random() * 151) + 1
+      // Generate random number of Pokemon (1-5)
+      const numPokemon = Math.floor(Math.random() * 5) + 1
       
-      // Fetch Pokemon data from PokéAPI
-      const response = await fetch(`https://pokeapi.co/api/v2/pokemon/${randomPokemonId}/`)
-      const data = await response.json()
+      // Get image dimensions
+      const imageWidth = imageRef.current.naturalWidth || imageRef.current.width
+      const imageHeight = imageRef.current.naturalHeight || imageRef.current.height
       
-      // Get the Pokemon image URL (prefer official artwork, fallback to front default)
-      const imageUrl = data.sprites.other?.['official-artwork']?.front_default || 
-                       data.sprites.front_default
+      const newPokemonList = []
+      const existingPokemonForCollision = [] // Track placed Pokemon for collision detection
       
-      if (imageUrl && imageRef.current) {
-        // Generate random scale 
-        const randomScale = Math.random() * 0.4 + 0.2
-        
-        // Get image dimensions
-        const imageWidth = imageRef.current.naturalWidth || imageRef.current.width
-        const imageHeight = imageRef.current.naturalHeight || imageRef.current.height
-        
-        // Find a position in the background
-        const position = findBackgroundPosition(
-          randomScale,
-          imageWidth,
-          imageHeight,
-          backgroundMask.width,
-          backgroundMask.height
-        )
-        
-        if (!position) {
-          // No valid background position found - try with a smaller scale
-          let foundPosition = null
-          let currentScale = randomScale
+      // Generate and place each Pokemon
+      for (let i = 0; i < numPokemon; i++) {
+        try {
+          // Generate random Pokemon ID between 1-151
+          const randomPokemonId = Math.floor(Math.random() * 151) + 1
           
-          // Try progressively smaller scales until we find a valid position
-          for (let scaleAttempt = 0; scaleAttempt < 5; scaleAttempt++) {
-            currentScale = currentScale * 0.8 // Reduce scale by 20%
-            if (currentScale < 0.05) break // Don't go too small
-            
-            foundPosition = findBackgroundPosition(
-              currentScale,
-              imageWidth,
-              imageHeight,
-              backgroundMask.width,
-              backgroundMask.height
-            )
-            
-            if (foundPosition) {
-              // Found valid position with smaller scale
-              const leftPercent = (foundPosition.x / imageWidth) * 100
-              const topPercent = (foundPosition.y / imageHeight) * 100
+          // Fetch Pokemon data from PokéAPI
+          const response = await fetch(`https://pokeapi.co/api/v2/pokemon/${randomPokemonId}/`)
+          const data = await response.json()
+          
+          // Get the Pokemon image URL (prefer official artwork, fallback to front default)
+          const imageUrl = data.sprites.other?.['official-artwork']?.front_default || 
+                           data.sprites.front_default
+          
+          if (!imageUrl) continue
+          
+          // Generate random scale 
+          const randomScale = Math.random() * 0.4 + 0.2
+          
+          // Find a position in the background (checking for collisions)
+          let position = findBackgroundPosition(
+            randomScale,
+            imageWidth,
+            imageHeight,
+            backgroundMask.width,
+            backgroundMask.height,
+            existingPokemonForCollision
+          )
+          
+          // If no position found, try with smaller scales
+          let currentScale = randomScale
+          if (!position) {
+            for (let scaleAttempt = 0; scaleAttempt < 5; scaleAttempt++) {
+              currentScale = currentScale * 0.8 // Reduce scale by 20%
+              if (currentScale < 0.05) break // Don't go too small
               
-              setPokemonImage(imageUrl)
-              setPokemonStyle({
-                scale: currentScale,
-                left: `${leftPercent}%`,
-                top: `${topPercent}%`
-              })
-              return // Successfully placed
+              position = findBackgroundPosition(
+                currentScale,
+                imageWidth,
+                imageHeight,
+                backgroundMask.width,
+                backgroundMask.height,
+                existingPokemonForCollision
+              )
+              
+              if (position) break // Found valid position
             }
           }
           
-          // If still no position found, alert user
-          alert('Could not find a suitable background area for the Pokemon. Try adjusting the threshold slider to detect more background areas.')
-          return
+          // If we found a valid position, add Pokemon to list
+          if (position) {
+            const pokemonWidth = imageWidth * currentScale
+            const pokemonHeight = imageHeight * currentScale
+            
+            // Convert to percentage for CSS
+            const leftPercent = (position.x / imageWidth) * 100
+            const topPercent = (position.y / imageHeight) * 100
+            
+            // Add to Pokemon list
+            newPokemonList.push({
+              imageUrl,
+              scale: currentScale,
+              left: `${leftPercent}%`,
+              top: `${topPercent}%`
+            })
+            
+            // Add to collision tracking
+            existingPokemonForCollision.push({
+              x: position.x,
+              y: position.y,
+              width: pokemonWidth,
+              height: pokemonHeight
+            })
+          }
+        } catch (error) {
+          console.error(`Error fetching Pokemon ${i + 1}:`, error)
+          // Continue to next Pokemon even if one fails
         }
-        
-        // Convert to percentage for CSS
-        const leftPercent = (position.x / imageWidth) * 100
-        const topPercent = (position.y / imageHeight) * 100
-        
-        setPokemonImage(imageUrl)
-        setPokemonStyle({
-          scale: randomScale,
-          left: `${leftPercent}%`,
-          top: `${topPercent}%`
-        })
+      }
+      
+      if (newPokemonList.length > 0) {
+        setPokemonList(newPokemonList)
+      } else {
+        alert('Could not find suitable background areas for any Pokemon. Try adjusting the threshold slider to detect more background areas.')
       }
     } catch (error) {
-      console.error('Error fetching Pokemon:', error)
-      alert('Failed to fetch Pokemon. Please try again.')
+      console.error('Error generating Pokemon:', error)
+      alert('Failed to generate Pokemon. Please try again.')
     } finally {
       setIsLoading(false)
     }
@@ -427,18 +478,19 @@ function App() {
                   className="mask-overlay"
                 />
               )}
-              {pokemonImage && pokemonStyle && (
+              {pokemonList.map((pokemon, index) => (
                 <img 
-                  src={pokemonImage} 
-                  alt="Pokemon overlay" 
+                  key={index}
+                  src={pokemon.imageUrl} 
+                  alt={`Pokemon ${index + 1}`} 
                   className="pokemon-overlay"
                   style={{
-                    transform: `scale(${pokemonStyle.scale})`,
-                    left: pokemonStyle.left,
-                    top: pokemonStyle.top
+                    transform: `scale(${pokemon.scale})`,
+                    left: pokemon.left,
+                    top: pokemon.top
                   }}
                 />
-              )}
+              ))}
             </div>
             <div className="controls">
               <div className="slider-container">
