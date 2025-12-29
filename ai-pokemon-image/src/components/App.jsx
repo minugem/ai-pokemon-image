@@ -79,7 +79,7 @@ function App() {
   return (
     <>
       <div className="app-container">
-        <h1>Image Selector</h1>
+        <h1>Pokéfy Your Image</h1>
         {!baseImage ? (
           <button onClick={handleButtonClick} className="select-button">
             Select Image
