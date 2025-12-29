@@ -5,13 +5,16 @@ function App() {
   const [baseImage, setBaseImage] = useState(null)
   const [baseImageFile, setBaseImageFile] = useState(null)
   const [backgroundMask, setBackgroundMask] = useState(null)
+  const [originalImageData, setOriginalImageData] = useState(null) // Store original processed image data
   const [pokemonImage, setPokemonImage] = useState(null)
   const [pokemonStyle, setPokemonStyle] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
   const [isProcessingBackground, setIsProcessingBackground] = useState(false)
   const [backgroundThreshold, setBackgroundThreshold] = useState(0.5)
+  const [showMaskOverlay, setShowMaskOverlay] = useState(false)
   const fileInputRef = useRef(null)
   const imageRef = useRef(null)
+  const maskCanvasRef = useRef(null)
   
   // rembg API endpoint - defaults to localhost:5001, can be overridden with env variable
   const REMBG_API_URL = import.meta.env.VITE_REMBG_API_URL || 'http://localhost:5001/remove-background'
@@ -95,14 +98,21 @@ function App() {
         
         ctx.drawImage(img, 0, 0)
 
-        // Get image data to create mask
+        // Get image data and store it for threshold recalculation
         // rembg returns image with transparent background, so low alpha = background
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-        const mask = new Uint8Array(imageData.data.length / 4)
         
+        // Store original image data for threshold recalculation
+        setOriginalImageData({
+          data: new Uint8ClampedArray(imageData.data),
+          width: canvas.width,
+          height: canvas.height
+        })
+
+        // Calculate initial mask
+        const mask = new Uint8Array(imageData.data.length / 4)
         for (let i = 0; i < imageData.data.length; i += 4) {
           const alpha = imageData.data[i + 3] / 255
-          // If alpha is below threshold, it's background (1), otherwise foreground (0)
           mask[i / 4] = alpha < backgroundThreshold ? 1 : 0
         }
 
@@ -124,9 +134,80 @@ function App() {
     }
 
     if (baseImageFile && imageRef.current) {
+      // Always process when baseImageFile changes (new image selected)
       processBackground()
     }
-  }, [baseImageFile, backgroundThreshold, REMBG_API_URL])
+  }, [baseImageFile, REMBG_API_URL])
+
+  // Recalculate mask when threshold changes (without calling API)
+  useEffect(() => {
+    if (!originalImageData) return
+
+    const mask = new Uint8Array(originalImageData.data.length / 4)
+    for (let i = 0; i < originalImageData.data.length; i += 4) {
+      const alpha = originalImageData.data[i + 3] / 255
+      mask[i / 4] = alpha < backgroundThreshold ? 1 : 0
+    }
+
+    setBackgroundMask({
+      data: mask,
+      width: originalImageData.width,
+      height: originalImageData.height
+    })
+  }, [backgroundThreshold, originalImageData])
+
+  // Update mask overlay visualization
+  useEffect(() => {
+    if (!backgroundMask || !maskCanvasRef.current || !imageRef.current) return
+
+    const canvas = maskCanvasRef.current
+    const img = imageRef.current
+    
+    // Match canvas size to displayed image
+    const rect = img.getBoundingClientRect()
+    canvas.width = rect.width
+    canvas.height = rect.height
+    
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    // Scale mask to canvas size
+    const scaleX = canvas.width / backgroundMask.width
+    const scaleY = canvas.height / backgroundMask.height
+
+    // Create image data for overlay
+    const imageData = ctx.createImageData(canvas.width, canvas.height)
+    
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const maskX = Math.floor(x / scaleX)
+        const maskY = Math.floor(y / scaleY)
+        
+        if (maskX >= 0 && maskX < backgroundMask.width && maskY >= 0 && maskY < backgroundMask.height) {
+          const maskIndex = maskY * backgroundMask.width + maskX
+          const isBackground = backgroundMask.data[maskIndex] === 1
+          
+          const pixelIndex = (y * canvas.width + x) * 4
+          
+          if (isBackground) {
+            // Highlight background areas in semi-transparent green
+            imageData.data[pixelIndex] = 0      // R
+            imageData.data[pixelIndex + 1] = 255  // G
+            imageData.data[pixelIndex + 2] = 0    // B
+            imageData.data[pixelIndex + 3] = 100  // Alpha (semi-transparent)
+          } else {
+            // Make foreground transparent
+            imageData.data[pixelIndex] = 0
+            imageData.data[pixelIndex + 1] = 0
+            imageData.data[pixelIndex + 2] = 0
+            imageData.data[pixelIndex + 3] = 0
+          }
+        }
+      }
+    }
+    
+    ctx.putImageData(imageData, 0, 0)
+  }, [backgroundMask, backgroundThreshold, showMaskOverlay])
 
   const handleButtonClick = () => {
     fileInputRef.current?.click()
@@ -141,6 +222,7 @@ function App() {
     setPokemonImage(null)
     setPokemonStyle(null)
     setBackgroundMask(null)
+    setOriginalImageData(null)
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
     }
@@ -154,44 +236,77 @@ function App() {
     const scaleX = imageWidth / maskWidth
     const scaleY = imageHeight / maskHeight
     
-    const maxAttempts = 100
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      // Generate random position
-      const maxX = imageWidth - pokemonWidth
-      const maxY = imageHeight - pokemonHeight
-      
-      if (maxX <= 0 || maxY <= 0) {
-        // Pokemon too large, use center
-        return { x: imageWidth / 2 - pokemonWidth / 2, y: imageHeight / 2 - pokemonHeight / 2 }
-      }
-      
-      const randomX = Math.random() * maxX
-      const randomY = Math.random() * maxY
-      
-      // Check if position is in background area
-      const centerX = randomX + pokemonWidth / 2
-      const centerY = randomY + pokemonHeight / 2
-      
-      // Convert to mask coordinates
-      const maskX = Math.floor(centerX / scaleX)
-      const maskY = Math.floor(centerY / scaleY)
+    // Check if Pokemon fits in image
+    const maxX = imageWidth - pokemonWidth
+    const maxY = imageHeight - pokemonHeight
+    
+    if (maxX <= 0 || maxY <= 0) {
+      // Pokemon too large - try to find any background area that fits
+      // This shouldn't happen with reasonable scales, but handle it gracefully
+      return null
+    }
+    
+    // Helper function to check if a point is in background
+    const isBackgroundPoint = (x, y) => {
+      const maskX = Math.floor(x / scaleX)
+      const maskY = Math.floor(y / scaleY)
       
       if (maskX >= 0 && maskX < maskWidth && maskY >= 0 && maskY < maskHeight) {
         const maskIndex = maskY * maskWidth + maskX
-        if (backgroundMask.data[maskIndex] === 1) {
-          // Found background position
-          return { x: randomX, y: randomY }
+        return backgroundMask.data[maskIndex] === 1
+      }
+      return false
+    }
+    
+    // Helper function to check if entire Pokemon area is in background
+    // Checks a small area around the position for any non-background pixels
+    const isPositionValid = (x, y) => {
+      // Define the area to check - the Pokemon's bounding box
+      const checkAreaWidth = pokemonWidth
+      const checkAreaHeight = pokemonHeight
+      
+      // Sample points in a grid pattern across the area
+      // Use a reasonable sampling density (check every N pixels)
+      const sampleDensity = Math.max(5, Math.min(pokemonWidth, pokemonHeight) / 10) // Sample every 5-10% of size
+      const stepX = Math.max(1, checkAreaWidth / sampleDensity)
+      const stepY = Math.max(1, checkAreaHeight / sampleDensity)
+      
+      // Check all points in the area
+      for (let checkY = y; checkY < y + checkAreaHeight; checkY += stepY) {
+        for (let checkX = x; checkX < x + checkAreaWidth; checkX += stepX) {
+          // If any point is NOT in background, reject this position
+          if (!isBackgroundPoint(checkX, checkY)) {
+            return false
+          }
         }
+      }
+      
+      // All checked points are in background - position is valid
+      return true
+    }
+    
+    // Try to find a valid background position
+    const maxAttempts = 500 // Increased attempts for better coverage
+    const backgroundPositions = []
+    
+    // First, collect all potential background positions
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const randomX = Math.random() * maxX
+      const randomY = Math.random() * maxY
+      
+      if (isPositionValid(randomX, randomY)) {
+        backgroundPositions.push({ x: randomX, y: randomY })
       }
     }
     
-    // Fallback: return random position if no background found
-    const maxX = imageWidth - pokemonWidth
-    const maxY = imageHeight - pokemonHeight
-    return {
-      x: Math.max(0, Math.random() * maxX),
-      y: Math.max(0, Math.random() * maxY)
+    // If we found valid positions, return a random one
+    if (backgroundPositions.length > 0) {
+      const randomIndex = Math.floor(Math.random() * backgroundPositions.length)
+      return backgroundPositions[randomIndex]
     }
+    
+    // If no valid position found, return null (don't place Pokemon)
+    return null
   }
 
   const handleGenerate = async () => {
@@ -211,8 +326,8 @@ function App() {
                        data.sprites.front_default
       
       if (imageUrl && imageRef.current) {
-        // Generate random scale between 0.0 and 0.9
-        const randomScale = Math.random() * 0.9
+        // Generate random scale 
+        const randomScale = Math.random() * 0.4 + 0.2
         
         // Get image dimensions
         const imageWidth = imageRef.current.naturalWidth || imageRef.current.width
@@ -226,6 +341,44 @@ function App() {
           backgroundMask.width,
           backgroundMask.height
         )
+        
+        if (!position) {
+          // No valid background position found - try with a smaller scale
+          let foundPosition = null
+          let currentScale = randomScale
+          
+          // Try progressively smaller scales until we find a valid position
+          for (let scaleAttempt = 0; scaleAttempt < 5; scaleAttempt++) {
+            currentScale = currentScale * 0.8 // Reduce scale by 20%
+            if (currentScale < 0.05) break // Don't go too small
+            
+            foundPosition = findBackgroundPosition(
+              currentScale,
+              imageWidth,
+              imageHeight,
+              backgroundMask.width,
+              backgroundMask.height
+            )
+            
+            if (foundPosition) {
+              // Found valid position with smaller scale
+              const leftPercent = (foundPosition.x / imageWidth) * 100
+              const topPercent = (foundPosition.y / imageHeight) * 100
+              
+              setPokemonImage(imageUrl)
+              setPokemonStyle({
+                scale: currentScale,
+                left: `${leftPercent}%`,
+                top: `${topPercent}%`
+              })
+              return // Successfully placed
+            }
+          }
+          
+          // If still no position found, alert user
+          alert('Could not find a suitable background area for the Pokemon. Try adjusting the threshold slider to detect more background areas.')
+          return
+        }
         
         // Convert to percentage for CSS
         const leftPercent = (position.x / imageWidth) * 100
@@ -268,6 +421,12 @@ function App() {
                 alt="Selected" 
                 className="selected-image" 
               />
+              {showMaskOverlay && backgroundMask && (
+                <canvas 
+                  ref={maskCanvasRef}
+                  className="mask-overlay"
+                />
+              )}
               {pokemonImage && pokemonStyle && (
                 <img 
                   src={pokemonImage} 
@@ -294,6 +453,10 @@ function App() {
                   step="0.01"
                   value={backgroundThreshold}
                   onChange={(e) => setBackgroundThreshold(parseFloat(e.target.value))}
+                  onMouseEnter={() => setShowMaskOverlay(true)}
+                  onMouseLeave={() => setShowMaskOverlay(false)}
+                  onFocus={() => setShowMaskOverlay(true)}
+                  onBlur={() => setShowMaskOverlay(false)}
                   className="threshold-slider"
                   disabled={isProcessingBackground}
                 />
