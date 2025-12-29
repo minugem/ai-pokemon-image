@@ -1,0 +1,6 @@
+rembg
+flask
+flask-cors
+pillow
+onnxruntime
+
