@@ -258,7 +258,7 @@ function App() {
     return false
   }
 
-  const findBackgroundPosition = (scale, imageWidth, imageHeight, maskWidth, maskHeight, existingPokemon = []) => {
+  const findBackgroundPosition = (scale, imageWidth, imageHeight, maskWidth, maskHeight, existingPokemon = [], verticalConstraint = null) => {
     const pokemonWidth = imageWidth * scale
     const pokemonHeight = imageHeight * scale
     
@@ -268,11 +268,22 @@ function App() {
     
     // Check if Pokemon fits in image
     const maxX = imageWidth - pokemonWidth
-    const maxY = imageHeight - pokemonHeight
+    let maxY = imageHeight - pokemonHeight
+    let minY = 0
     
-    if (maxX <= 0 || maxY <= 0) {
-      // Pokemon too large - try to find any background area that fits
-      // This shouldn't happen with reasonable scales, but handle it gracefully
+    // Apply vertical constraint based on Pokemon type
+    if (verticalConstraint === 'top') {
+      // Flying Pokemon: only in top half
+      maxY = imageHeight / 2 - pokemonHeight
+      minY = 0
+    } else if (verticalConstraint === 'bottom') {
+      // Ground Pokemon: only in bottom half
+      minY = imageHeight / 2
+      maxY = imageHeight - pokemonHeight
+    }
+    
+    if (maxX <= 0 || maxY <= 0 || minY >= maxY) {
+      // Pokemon too large or constraint makes it impossible
       return null
     }
     
@@ -322,7 +333,7 @@ function App() {
     // First, collect all potential background positions
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const randomX = Math.random() * maxX
-      const randomY = Math.random() * maxY
+      const randomY = minY + Math.random() * (maxY - minY) // Respect vertical constraint
       
       if (isPositionValid(randomX, randomY)) {
         // Check collision with existing Pokemon
@@ -361,7 +372,7 @@ function App() {
       for (let i = 0; i < numPokemon; i++) {
         try {
           // Generate random Pokemon ID between 1-151
-          const randomPokemonId = Math.floor(Math.random() * 151) + 1
+          const randomPokemonId = Math.floor(Math.random() * 1024) + 1
           
           // Fetch Pokemon data from PokéAPI
           const response = await fetch(`https://pokeapi.co/api/v2/pokemon/${randomPokemonId}/`)
@@ -373,17 +384,31 @@ function App() {
           
           if (!imageUrl) continue
           
+          // Check Pokemon types
+          const pokemonTypes = data.types.map(type => type.type.name.toLowerCase())
+          const isFlying = pokemonTypes.includes('flying')
+          const isDragon = pokemonTypes.includes('dragon')
+          
+          // Determine vertical constraint based on type
+          // ONLY Flying and Dragon can be in top half
+          // All other types must be in bottom half
+          let verticalConstraint = 'bottom' // Default: bottom half for all non-flying/dragon
+          if (isFlying || isDragon) {
+            verticalConstraint = 'top' // Flying and Dragon Pokemon in top half only
+          }
+          
           // Generate random scale 
           const randomScale = Math.random() * 0.4 + 0.2
           
-          // Find a position in the background (checking for collisions)
+          // Find a position in the background (checking for collisions and type constraints)
           let position = findBackgroundPosition(
             randomScale,
             imageWidth,
             imageHeight,
             backgroundMask.width,
             backgroundMask.height,
-            existingPokemonForCollision
+            existingPokemonForCollision,
+            verticalConstraint
           )
           
           // If no position found, try with smaller scales
@@ -399,7 +424,8 @@ function App() {
                 imageHeight,
                 backgroundMask.width,
                 backgroundMask.height,
-                existingPokemonForCollision
+                existingPokemonForCollision,
+                verticalConstraint
               )
               
               if (position) break // Found valid position
