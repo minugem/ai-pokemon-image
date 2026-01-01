@@ -4,7 +4,11 @@ import '../styles/App.css'
 function App() {
   const [baseImage, setBaseImage] = useState(null)
   const [baseImageFile, setBaseImageFile] = useState(null)
-  const [backgroundMask, setBackgroundMask] = useState(null)
+  const [backgroundMask, setBackgroundMask] = useState(null) // Combined background mask
+  const [subjectMask, setSubjectMask] = useState(null) // Subject mask
+  const [skyMask, setSkyMask] = useState(null) // Sky mask
+  const [groundMask, setGroundMask] = useState(null) // Ground mask
+  const [otherMask, setOtherMask] = useState(null) // Other background mask
   const [originalImageData, setOriginalImageData] = useState(null) // Store original processed image data
   const [pokemonList, setPokemonList] = useState([]) // Array of {imageUrl, scale, left, top}
   const [isLoading, setIsLoading] = useState(false)
@@ -15,8 +19,10 @@ function App() {
   const imageRef = useRef(null)
   const maskCanvasRef = useRef(null)
   
-  // rembg API endpoint - defaults to localhost:5001, can be overridden with env variable
-  const REMBG_API_URL = import.meta.env.VITE_REMBG_API_URL || 'http://localhost:5001/remove-background'
+  // SAM API endpoint - defaults to localhost:5001, can be overridden with env variable
+  const SAM_API_URL = import.meta.env.VITE_SAM_API_URL || 'http://localhost:5001'
+  const SEGMENT_API_URL = `${SAM_API_URL}/segment`
+  const REMOVE_BG_API_URL = `${SAM_API_URL}/remove-background`
 
   const handleImageSelect = (event) => {
     const file = event.target.files[0]
@@ -27,6 +33,10 @@ function App() {
       // Clear Pokemon overlay when new image is selected
       setPokemonList([])
       setBackgroundMask(null)
+      setSubjectMask(null)
+      setSkyMask(null)
+      setGroundMask(null)
+      setOtherMask(null)
       // Process background after image loads
       setIsProcessingBackground(true)
     }
@@ -53,11 +63,11 @@ function App() {
           throw new Error('Invalid image dimensions')
         }
 
-        // Call rembg API to get background-removed image
+        // Call SAM segment API to get segmentation mask
         const formData = new FormData()
         formData.append('image', baseImageFile)
 
-        const response = await fetch(REMBG_API_URL, {
+        const response = await fetch(SEGMENT_API_URL, {
           method: 'POST',
           body: formData
         })
@@ -70,11 +80,11 @@ function App() {
         const blob = await response.blob()
         
         if (!blob || blob.size === 0) {
-          throw new Error('Background removal returned empty result')
+          throw new Error('Segmentation returned empty result')
         }
 
         // Create canvas to get mask data from the result
-        // rembg returns an image with transparent background
+        // Segmentation returns colored mask: red=subject, blue=sky, green=ground, yellow=other
         const img = new Image()
         const blobUrl = URL.createObjectURL(blob)
         img.src = blobUrl
@@ -82,7 +92,7 @@ function App() {
         await new Promise((resolve, reject) => {
           img.onload = resolve
           img.onerror = reject
-          setTimeout(() => reject(new Error('Processed image load timeout')), 10000)
+          setTimeout(() => reject(new Error('Segmentation image load timeout')), 10000)
         })
 
         const canvas = document.createElement('canvas')
@@ -96,8 +106,7 @@ function App() {
         
         ctx.drawImage(img, 0, 0)
 
-        // Get image data and store it for threshold recalculation
-        // rembg returns image with transparent background, so low alpha = background
+        // Get image data from segmentation result
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
         
         // Store original image data for threshold recalculation
@@ -107,24 +116,142 @@ function App() {
           height: canvas.height
         })
 
-        // Calculate initial mask
-        const mask = new Uint8Array(imageData.data.length / 4)
+        // Process segmentation mask to extract 4 separate masks
+        // Backend sends: Magenta (255, 0, 255) = subject, Cyan (0, 255, 255) = sky, Orange (255, 165, 0) = ground, Yellow (255, 255, 0) = other
+        const subject = new Uint8Array(imageData.data.length / 4)
+        const sky = new Uint8Array(imageData.data.length / 4)
+        const ground = new Uint8Array(imageData.data.length / 4)
+        const other = new Uint8Array(imageData.data.length / 4)
+        const combinedBackground = new Uint8Array(imageData.data.length / 4)
+        
         for (let i = 0; i < imageData.data.length; i += 4) {
-          const alpha = imageData.data[i + 3] / 255
-          mask[i / 4] = alpha < backgroundThreshold ? 1 : 0
+          const r = imageData.data[i]
+          const g = imageData.data[i + 1]
+          const b = imageData.data[i + 2]
+          
+          // Determine class based on backend colors
+          // Magenta: high R and B, low G (subject)
+          if (r > 200 && b > 200 && g < 100) {
+            subject[i / 4] = 1
+            sky[i / 4] = 0
+            ground[i / 4] = 0
+            other[i / 4] = 0
+            combinedBackground[i / 4] = 0
+          } 
+          // Cyan: high G and B, low R (sky)
+          else if (g > 200 && b > 200 && r < 100) {
+            sky[i / 4] = 1
+            subject[i / 4] = 0
+            ground[i / 4] = 0
+            other[i / 4] = 0
+            combinedBackground[i / 4] = 1
+          } 
+          // Orange: high R, medium G (around 165), low B (ground)
+          else if (r > 200 && g > 140 && g < 190 && b < 50) {
+            ground[i / 4] = 1
+            subject[i / 4] = 0
+            sky[i / 4] = 0
+            other[i / 4] = 0
+            combinedBackground[i / 4] = 1
+          } 
+          // Yellow: high R and G, low B (other)
+          else if (r > 200 && g > 200 && b < 100) {
+            other[i / 4] = 1
+            subject[i / 4] = 0
+            sky[i / 4] = 0
+            ground[i / 4] = 0
+            combinedBackground[i / 4] = 1
+          } else {
+            // Re-classify based on actual image colors with threshold
+            const brightness = (r + g + b) / 3
+            const saturation = Math.max(r, g, b) - Math.min(r, g, b)
+            
+            // Threshold affects detection sensitivity
+            const skyBrightnessThreshold = 90 + (1 - backgroundThreshold) * 40  // 90-130 (more lenient)
+            const skyBlueThreshold = 90 + (1 - backgroundThreshold) * 30  // 90-120 (more lenient)
+            const groundGreenThreshold = 100 - (1 - backgroundThreshold) * 20
+            const groundBrightnessThreshold = 200 + (1 - backgroundThreshold) * 30
+            
+            // Sky detection - more lenient, check FIRST
+            const is_sky_like = (
+              brightness > skyBrightnessThreshold &&
+              b > skyBlueThreshold &&
+              (b > r || b > g) &&  // Blue is at least equal to or higher than one other component
+              (b > r + 10 || b > g + 10) &&  // Blue is somewhat dominant
+              saturation < 160  // Not too colorful
+            )
+            
+            // Ground detection - explicitly exclude blue-dominant pixels
+            const is_green_dominant = g > r + 20 && g > b + 20
+            const is_brownish = r > 100 && g > 80 && b < 100 && Math.abs(r - g) < 30
+            
+            const is_ground_like = (
+              !is_sky_like &&  // NOT sky
+              b < 100 &&  // Blue is LOW (critical for separating from sky)
+              (
+                (is_green_dominant && g > groundGreenThreshold && brightness < groundBrightnessThreshold) ||
+                (is_brownish && brightness < 200) ||
+                (g > 90 && r > 70 && b < 90 && brightness < 210 && b < r && b < g) ||
+                (r > 80 && g > 70 && b < 80 && brightness < 190)
+              )
+            )
+            
+            // Sky takes priority
+            if (is_sky_like) {
+              sky[i / 4] = 1
+              ground[i / 4] = 0
+              other[i / 4] = 0
+              combinedBackground[i / 4] = 1
+            } else if (is_ground_like) {
+              sky[i / 4] = 0
+              ground[i / 4] = 1
+              other[i / 4] = 0
+              combinedBackground[i / 4] = 1
+            } else {
+              sky[i / 4] = 0
+              ground[i / 4] = 0
+              other[i / 4] = 1
+              combinedBackground[i / 4] = 1
+            }
+            subject[i / 4] = 0
+          }
         }
 
         // Clean up blob URL
         URL.revokeObjectURL(blobUrl)
 
+        setSubjectMask({
+          data: subject,
+          width: canvas.width,
+          height: canvas.height
+        })
+        
+        setSkyMask({
+          data: sky,
+          width: canvas.width,
+          height: canvas.height
+        })
+        
+        setGroundMask({
+          data: ground,
+          width: canvas.width,
+          height: canvas.height
+        })
+        
+        setOtherMask({
+          data: other,
+          width: canvas.width,
+          height: canvas.height
+        })
+        
         setBackgroundMask({
-          data: mask,
+          data: combinedBackground,
           width: canvas.width,
           height: canvas.height
         })
       } catch (error) {
         console.error('Error processing background:', error)
-        alert(`Failed to process background: ${error.message || 'Unknown error'}. Make sure your rembg backend server is running at ${REMBG_API_URL}`)
+        alert(`Failed to process background: ${error.message || 'Unknown error'}. Make sure your SAM backend server is running at ${SAM_API_URL}`)
         setIsProcessingBackground(false)
       } finally {
         setIsProcessingBackground(false)
@@ -135,28 +262,154 @@ function App() {
       // Always process when baseImageFile changes (new image selected)
       processBackground()
     }
-  }, [baseImageFile, REMBG_API_URL])
+  }, [baseImageFile, SEGMENT_API_URL])
 
-  // Recalculate mask when threshold changes (without calling API)
+  // Recalculate masks when threshold changes (without calling API)
   useEffect(() => {
     if (!originalImageData) return
 
-    const mask = new Uint8Array(originalImageData.data.length / 4)
+    const subject = new Uint8Array(originalImageData.data.length / 4)
+    const sky = new Uint8Array(originalImageData.data.length / 4)
+    const ground = new Uint8Array(originalImageData.data.length / 4)
+    const other = new Uint8Array(originalImageData.data.length / 4)
+    const combinedBackground = new Uint8Array(originalImageData.data.length / 4)
+    
     for (let i = 0; i < originalImageData.data.length; i += 4) {
-      const alpha = originalImageData.data[i + 3] / 255
-      mask[i / 4] = alpha < backgroundThreshold ? 1 : 0
+      const r = originalImageData.data[i]
+      const g = originalImageData.data[i + 1]
+      const b = originalImageData.data[i + 2]
+      
+      // Determine class based on distinct colors
+      // Magenta: high R and B, low G
+      if (r > 200 && b > 200 && g < 100) {
+        // Subject (magenta)
+        subject[i / 4] = 1
+        sky[i / 4] = 0
+        ground[i / 4] = 0
+        other[i / 4] = 0
+        combinedBackground[i / 4] = 0
+      } 
+      // Cyan: high G and B, low R
+      else if (g > 200 && b > 200 && r < 100) {
+        // Sky (cyan)
+        subject[i / 4] = 0
+        sky[i / 4] = 1
+        ground[i / 4] = 0
+        other[i / 4] = 0
+        combinedBackground[i / 4] = 1
+      } 
+      // Orange: high R, medium G, low B
+      else if (r > 200 && g > 100 && g < 200 && b < 100) {
+        // Ground (orange)
+        subject[i / 4] = 0
+        sky[i / 4] = 0
+        ground[i / 4] = 1
+        other[i / 4] = 0
+        combinedBackground[i / 4] = 1
+      } 
+      // Yellow: high R and G, low B
+      else if (r > 200 && g > 200 && b < 100) {
+        // Other (yellow)
+        subject[i / 4] = 0
+        sky[i / 4] = 0
+        ground[i / 4] = 0
+        other[i / 4] = 1
+        combinedBackground[i / 4] = 1
+      } else {
+        // Re-classify based on color characteristics with threshold adjustment
+        const brightness = (r + g + b) / 3
+        const saturation = Math.max(r, g, b) - Math.min(r, g, b)
+        
+        // Threshold affects detection sensitivity
+        // Lower threshold = more sensitive (detects more sky/ground)
+        // Higher threshold = less sensitive (detects less sky/ground)
+        const skyBrightnessThreshold = 120 + (1 - backgroundThreshold) * 40  // 120-160
+        const skyBlueThreshold = 130 + (1 - backgroundThreshold) * 30  // 130-160
+        const groundGreenThreshold = 100 - (1 - backgroundThreshold) * 20  // 80-100
+        const groundBrightnessThreshold = 200 + (1 - backgroundThreshold) * 30  // 200-230
+        
+        // Sky detection with threshold - check FIRST, sky takes priority
+        // Very lenient sky detection - prioritize detecting sky correctly
+        const is_sky_like = (
+          brightness > (skyBrightnessThreshold - 50) &&  // Very lenient brightness (70-110)
+          b > (skyBlueThreshold - 50) &&  // Very lenient blue (80-110)
+          (b >= r || b >= g) &&  // Blue is at least equal to or higher than one other component
+          (b > r + 5 || b > g + 5) &&  // Blue is somewhat dominant (very lenient)
+          saturation < 180  // Not too colorful (very lenient)
+        )
+        
+        // Ground detection with threshold - explicitly exclude sky-like pixels
+        // CRITICAL: Blue must be LOW to be ground
+        const is_green_dominant = g > r + 20 && g > b + 20
+        const is_brownish = r > 100 && g > 80 && b < 100 && Math.abs(r - g) < 30
+        
+        const is_ground_like = (
+          !is_sky_like &&  // NOT sky - this prevents sky from being classified as ground
+          b < 90 &&  // Blue is LOW (critical for separating from sky - lowered threshold)
+          (
+            (is_green_dominant && g > groundGreenThreshold && brightness < groundBrightnessThreshold) ||  // Grass
+            (is_brownish && brightness < 200) ||  // Brown
+            (g > 90 && r > 70 && b < 80 && brightness < 210 && b < r && b < g) ||  // Earth tones (blue is lowest)
+            (r > 80 && g > 70 && b < 70 && brightness < 190)  // Darker earth tones (very low blue)
+          )
+        )
+        
+        // Sky takes priority - check sky first
+        if (is_sky_like) {
+          sky[i / 4] = 1
+          ground[i / 4] = 0
+          other[i / 4] = 0
+          combinedBackground[i / 4] = 1
+        } else if (is_ground_like) {
+          sky[i / 4] = 0
+          ground[i / 4] = 1
+          other[i / 4] = 0
+          combinedBackground[i / 4] = 1
+        } else {
+          // Other background
+          sky[i / 4] = 0
+          ground[i / 4] = 0
+          other[i / 4] = 1
+          combinedBackground[i / 4] = 1
+        }
+        subject[i / 4] = 0
+      }
     }
 
+    setSubjectMask({
+      data: subject,
+      width: originalImageData.width,
+      height: originalImageData.height
+    })
+    
+    setSkyMask({
+      data: sky,
+      width: originalImageData.width,
+      height: originalImageData.height
+    })
+    
+    setGroundMask({
+      data: ground,
+      width: originalImageData.width,
+      height: originalImageData.height
+    })
+    
+    setOtherMask({
+      data: other,
+      width: originalImageData.width,
+      height: originalImageData.height
+    })
+    
     setBackgroundMask({
-      data: mask,
+      data: combinedBackground,
       width: originalImageData.width,
       height: originalImageData.height
     })
   }, [backgroundThreshold, originalImageData])
 
-  // Update mask overlay visualization
+  // Update mask overlay visualization with different colors for each category
   useEffect(() => {
-    if (!backgroundMask || !maskCanvasRef.current || !imageRef.current) return
+    if (!backgroundMask || !subjectMask || !skyMask || !groundMask || !otherMask || !maskCanvasRef.current || !imageRef.current || !showMaskOverlay) return
 
     const canvas = maskCanvasRef.current
     const img = imageRef.current
@@ -183,18 +436,41 @@ function App() {
         
         if (maskX >= 0 && maskX < backgroundMask.width && maskY >= 0 && maskY < backgroundMask.height) {
           const maskIndex = maskY * backgroundMask.width + maskX
-          const isBackground = backgroundMask.data[maskIndex] === 1
+          
+          // Check each category
+          const isSubject = subjectMask.data[maskIndex] === 1
+          const isSky = skyMask.data[maskIndex] === 1
+          const isGround = groundMask.data[maskIndex] === 1
+          const isOther = otherMask.data[maskIndex] === 1
           
           const pixelIndex = (y * canvas.width + x) * 4
           
-          if (isBackground) {
-            // Highlight background areas in semi-transparent green
-            imageData.data[pixelIndex] = 0      // R
+          if (isSubject) {
+            // Subject = bright magenta/pink overlay
+            imageData.data[pixelIndex] = 255      // R
+            imageData.data[pixelIndex + 1] = 0    // G
+            imageData.data[pixelIndex + 2] = 255  // B (magenta)
+            imageData.data[pixelIndex + 3] = 150  // Alpha (more visible)
+          } else if (isSky) {
+            // Sky = bright cyan overlay
+            imageData.data[pixelIndex] = 0        // R
             imageData.data[pixelIndex + 1] = 255  // G
-            imageData.data[pixelIndex + 2] = 0    // B
-            imageData.data[pixelIndex + 3] = 100  // Alpha (semi-transparent)
+            imageData.data[pixelIndex + 2] = 255  // B (cyan)
+            imageData.data[pixelIndex + 3] = 150  // Alpha (more visible)
+          } else if (isGround) {
+            // Ground = bright orange overlay
+            imageData.data[pixelIndex] = 255      // R
+            imageData.data[pixelIndex + 1] = 165  // G
+            imageData.data[pixelIndex + 2] = 0    // B (orange)
+            imageData.data[pixelIndex + 3] = 150  // Alpha (more visible)
+          } else if (isOther) {
+            // Other = bright yellow overlay
+            imageData.data[pixelIndex] = 255      // R
+            imageData.data[pixelIndex + 1] = 255  // G
+            imageData.data[pixelIndex + 2] = 0  // B (yellow)
+            imageData.data[pixelIndex + 3] = 150  // Alpha (more visible)
           } else {
-            // Make foreground transparent
+            // No overlay
             imageData.data[pixelIndex] = 0
             imageData.data[pixelIndex + 1] = 0
             imageData.data[pixelIndex + 2] = 0
@@ -205,7 +481,7 @@ function App() {
     }
     
     ctx.putImageData(imageData, 0, 0)
-  }, [backgroundMask, backgroundThreshold, showMaskOverlay])
+  }, [backgroundMask, subjectMask, skyMask, groundMask, otherMask, backgroundThreshold, showMaskOverlay])
 
   const handleButtonClick = () => {
     fileInputRef.current?.click()
@@ -219,6 +495,10 @@ function App() {
     setBaseImageFile(null)
     setPokemonList([])
     setBackgroundMask(null)
+    setSubjectMask(null)
+    setSkyMask(null)
+    setGroundMask(null)
+    setOtherMask(null)
     setOriginalImageData(null)
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
@@ -258,7 +538,7 @@ function App() {
     return false
   }
 
-  const findBackgroundPosition = (scale, imageWidth, imageHeight, maskWidth, maskHeight, existingPokemon = [], verticalConstraint = null) => {
+  const findBackgroundPosition = (scale, imageWidth, imageHeight, maskWidth, maskHeight, existingPokemon = []) => {
     const pokemonWidth = imageWidth * scale
     const pokemonHeight = imageHeight * scale
     
@@ -268,22 +548,11 @@ function App() {
     
     // Check if Pokemon fits in image
     const maxX = imageWidth - pokemonWidth
-    let maxY = imageHeight - pokemonHeight
-    let minY = 0
+    const maxY = imageHeight - pokemonHeight
+    const minY = 0
     
-    // Apply vertical constraint based on Pokemon type
-    if (verticalConstraint === 'top') {
-      // Flying Pokemon: only in top half
-      maxY = imageHeight / 2 - pokemonHeight
-      minY = 0
-    } else if (verticalConstraint === 'bottom') {
-      // Ground Pokemon: only in bottom half
-      minY = imageHeight / 2
-      maxY = imageHeight - pokemonHeight
-    }
-    
-    if (maxX <= 0 || maxY <= 0 || minY >= maxY) {
-      // Pokemon too large or constraint makes it impossible
+    if (maxX <= 0 || maxY <= 0) {
+      // Pokemon too large
       return null
     }
     
@@ -333,7 +602,7 @@ function App() {
     // First, collect all potential background positions
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const randomX = Math.random() * maxX
-      const randomY = minY + Math.random() * (maxY - minY) // Respect vertical constraint
+      const randomY = Math.random() * maxY
       
       if (isPositionValid(randomX, randomY)) {
         // Check collision with existing Pokemon
@@ -384,31 +653,17 @@ function App() {
           
           if (!imageUrl) continue
           
-          // Check Pokemon types
-          const pokemonTypes = data.types.map(type => type.type.name.toLowerCase())
-          const isFlying = pokemonTypes.includes('flying')
-          const isDragon = pokemonTypes.includes('dragon')
-          
-          // Determine vertical constraint based on type
-          // ONLY Flying and Dragon can be in top half
-          // All other types must be in bottom half
-          let verticalConstraint = 'bottom' // Default: bottom half for all non-flying/dragon
-          if (isFlying || isDragon) {
-            verticalConstraint = 'top' // Flying and Dragon Pokemon in top half only
-          }
-          
           // Generate random scale 
           const randomScale = Math.random() * 0.4 + 0.2
           
-          // Find a position in the background (checking for collisions and type constraints)
+          // Find a position in the background (checking for collisions)
           let position = findBackgroundPosition(
             randomScale,
             imageWidth,
             imageHeight,
             backgroundMask.width,
             backgroundMask.height,
-            existingPokemonForCollision,
-            verticalConstraint
+            existingPokemonForCollision
           )
           
           // If no position found, try with smaller scales
@@ -424,8 +679,7 @@ function App() {
                 imageHeight,
                 backgroundMask.width,
                 backgroundMask.height,
-                existingPokemonForCollision,
-                verticalConstraint
+                existingPokemonForCollision
               )
               
               if (position) break // Found valid position
@@ -488,7 +742,7 @@ function App() {
           <>
             {isProcessingBackground && (
               <div className="processing-message">
-                Processing background with rembg... This may take a moment.
+                Processing background with SAM (detecting subject, sky, ground, and other)... This may take a moment.
               </div>
             )}
             <div className="image-container">

@@ -1,6 +1,7 @@
-rembg
 flask
 flask-cors
 pillow
-onnxruntime
+numpy
+torch
+torchvision
 
